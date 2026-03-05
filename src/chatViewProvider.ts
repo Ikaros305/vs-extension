@@ -50,10 +50,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ) {
         this._view = webviewView;
 
-        const mediaPath = vscode.Uri.joinPath(this._extensionUri, 'media');
         webviewView.webview.options = {
             enableScripts: true,
-            localResourceRoots: [this._extensionUri, mediaPath]
+            localResourceRoots: [this._extensionUri]
         };
 
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
@@ -97,6 +96,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     if (data.items) {
                         this._view?.webview.postMessage({ type: 'updateContextArea', items: data.items });
                     }
+                    break;
+                }
+                case 'addMessage': {
+                    this._view?.webview.postMessage({ type: 'addMessage', role: data.role, content: data.content });
+                    break;
+                }
+                case 'log': {
+                    console.log(`[Webview Log] ${data.value}`);
                     break;
                 }
                 case 'newChat':
@@ -766,20 +773,33 @@ Please automatically try to fix this issue by generating a new JSON Execution Pl
     }
 
     private _getHtmlForWebview(webview: vscode.Webview) {
-        const mediaUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media'));
-        const markedUri = `${mediaUri}/marked.min.js`;
-        const hlJsUri = `${mediaUri}/highlight.min.js`;
-        const hlCssUri = `${mediaUri}/github-dark.css`;
-
         return `<!DOCTYPE html>
             <html lang="en">
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} data:; font-src ${webview.cspSource}; connect-src https:;">
-                <link rel="stylesheet" href="${hlCssUri}">
-                <script src="${markedUri}"></script>
-                <script src="${hlJsUri}"></script>
+                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline' https:; script-src ${webview.cspSource} 'unsafe-inline' https:; img-src ${webview.cspSource} data: https:; font-src ${webview.cspSource} https:; connect-src https:;">
+                <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+                <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+                <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+                <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+                <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+                <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+                <script>
+                    const vscode = acquireVsCodeApi();
+                    window.onerror = function(msg, url, line, col, error) {
+                        vscode.postMessage({ 
+                            type: 'log', 
+                            value: '❌ Error: ' + msg + ' (Line: ' + line + ')' 
+                        });
+                        return false;
+                    };
+                    function diag(msg) {
+                        console.log('Diag: ' + msg);
+                        vscode.postMessage({ type: 'log', value: msg });
+                    }
+                    diag('Webview starting (Basic Mode)...');
+                </script>
                 <style>
                     :root {
                         --accent-color: var(--vscode-button-background, #007acc);
@@ -1094,9 +1114,14 @@ Please automatically try to fix this issue by generating a new JSON Execution Pl
                 </div>
                 <script>
                     (function() {
-                        const vscode = acquireVsCodeApi();
+                        diag('IIFE starting');
                         const messagesDiv = document.getElementById('messages');
                         const input = document.getElementById('chatInput');
+                        
+                        /* diag */
+                        /* diag */
+                        
+                        diag('DOM elements: ' + (messagesDiv?'msg ':'') + (input?'inp ':''));
                         const sendBtn = document.getElementById('sendBtn');
                         const stopBtn = document.getElementById('stopBtn');
                         const modelSelect = document.getElementById('modelSelect');
@@ -1114,7 +1139,7 @@ Please automatically try to fix this issue by generating a new JSON Execution Pl
                             attachedContext.forEach((ctx, index) => {
                                 const pill = document.createElement('div');
                                 pill.className = 'context-pill';
-                                pill.innerHTML = \`<span>\${ctx.name}</span><button class="context-pill-remove" data-index="\${index}">✕</button>\`;
+                                pill.innerHTML = '<span>' + ctx.name + '</span><button class="context-pill-remove" data-index="' + index + '">✕</button>';
                                 contextArea.appendChild(pill);
                             });
                             
@@ -1128,12 +1153,17 @@ Please automatically try to fix this issue by generating a new JSON Execution Pl
                         }
 
                         function safeParse(content) {
-                            try {
-                                return marked.parse(content);
-                            } catch (e) {
-                                console.error('Marked parse error:', e);
-                                return content;
-                            }
+                            if (!content) return '';
+                            // Very basic markdown-to-plaintext conversion for safety/no-dependency
+                            return content
+                                .replace(/&/g, '&amp;')
+                                .replace(/</g, '&lt;')
+                                .replace(/>/g, '&gt;')
+                                .replace(/"/g, '&quot;')
+                                .replace(/'/g, '&#039;')
+                                .replace(/\\n/g, '<br>')
+                                .replace(/\x60([^\x60]+)\x60/g, '<code>$1</code>')
+                                .replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');
                         }
 
                         function sendMessage() {
@@ -1194,25 +1224,24 @@ Please automatically try to fix this issue by generating a new JSON Execution Pl
                             // 1. Try text/uri-list (Common for VS Code Explorer)
                             const uriList = e.dataTransfer.getData('text/uri-list');
                             if (uriList) {
-                                const uris = uriList.split(/\r?\n/).filter(Boolean);
+                                const uris = uriList.split(/\\r?\\n/).filter(Boolean);
                                 uris.forEach(uri => {
                                     let path = uri.trim();
                                     // Remove file:// prefix (handles file://, file:///, etc.)
-                                    path = decodeURIComponent(path.replace(/^file:\/+/i, ''));
+                                    path = decodeURIComponent(path.replace(/^file:\\/+/i, ''));
                                     // Windows: /C:/path -> C:/path
-                                    path = path.replace(/^\/([a-zA-Z]:)/, '$1');
+                                    path = path.replace(/^\\/([a-zA-Z]:)/, '$1');
                                     // Normalize slashes
-                                    const name = path.split(/[\\\/]/).pop();
+                                    const name = path.split(/[\\\\\\/]/).pop();
                                     if (path) files.push({ name, path });
                                 });
-                            } 
-                            
+                            }                            
                             // 2. Fallback to text/plain (Sometimes contains paths)
                             if (files.length === 0) {
                                 const plainText = e.dataTransfer.getData('text/plain');
-                                if (plainText && (plainText.includes(':\\') || plainText.includes(':/') || plainText.startsWith('/'))) {
+                                if (plainText && (plainText.includes(':\\\\') || plainText.includes(':/') || plainText.startsWith('/'))) {
                                     const path = plainText.trim();
-                                    const name = path.split(/[\\\/]/).pop();
+                                    const name = path.split(/[\\\\\\/]/).pop();
                                     files.push({ name, path });
                                 }
                             }
@@ -1279,11 +1308,9 @@ Please automatically try to fix this issue by generating a new JSON Execution Pl
                             return container;
                         }
 
-                        marked.setOptions({
-                            highlight: function(code) {
-                                return hljs.highlightAuto(code).value;
-                            }
-                        });
+                        // marked.setOptions deprecated/removed in newer versions, 
+                        // we handle highlighting manually after parse in addMessageUI
+                        
 
                         function addMessageUI(role, content) {
                             if (role === 'assistant') {
@@ -1291,6 +1318,7 @@ Please automatically try to fix this issue by generating a new JSON Execution Pl
                                 const body = container.querySelector('.message');
                                 body.innerHTML = safeParse(content);
                                 body.querySelectorAll('pre code').forEach(el => {
+                                    // hljs removed for now
                                     hljs.highlightElement(el);
                                     addCopyButton(el.parentElement);
                                 });
@@ -1315,10 +1343,10 @@ Please automatically try to fix this issue by generating a new JSON Execution Pl
                             let html = '<div class="plan-header">⚡ EXECUTION PLAN</div>' +
                                        '<div style="font-size:11px; margin-bottom:10px;">' + plan.description + '</div>' +
                                         '<div class="plan-bulk-actions">' +
-                                            '<button class="bulk-btn primary" onclick="runAll(\'' + plan.planId + '\')">Run All</button>' +
-                                            '<button class="bulk-btn" onclick="trustAll(\'' + plan.planId + '\')">Trust All</button>' +
-                                            '<button class="bulk-btn danger" onclick="cancelAll(\'' + plan.planId + '\')">Cancel All</button>' +
-                                            '<button id="rollback-' + plan.planId + '" class="bulk-btn" style="display:none; border-color: var(--vscode-charts-orange);" onclick="rollback(\'' + plan.planId + '\')">↺ Rollback</button>' +
+                                            '<button class="bulk-btn primary" onclick="runAll(\\'' + plan.planId + '\\')">Run All</button>' +
+                                            '<button class="bulk-btn" onclick="trustAll(\\'' + plan.planId + '\\')">Trust All</button>' +
+                                            '<button class="bulk-btn danger" onclick="cancelAll(\\'' + plan.planId + '\\')">Cancel All</button>' +
+                                            '<button id="rollback-' + plan.planId + '" class="bulk-btn" style="display:none; border-color: var(--vscode-charts-orange);" onclick="rollback(\\'' + plan.planId + '\\')">↺ Rollback</button>' +
                                         '</div>' +
                                        '<div class="plan-actions">';
                             
@@ -1478,10 +1506,10 @@ Please automatically try to fix this issue by generating a new JSON Execution Pl
                                 case 'actionDiff':
                                     const dv = document.getElementById('diff-' + message.planId + '-' + message.actionId);
                                     if (dv) {
-                                        dv.innerHTML = message.diff.split('\n').map(line => {
-                                            if (line.startsWith('+')) return \`<div class="diff-add">\${line}</div>\`;
-                                            if (line.startsWith('-')) return \`<div class="diff-remove">\${line}</div>\`;
-                                            return \`<div>\${line}</div>\`;
+                                        dv.innerHTML = message.diff.split('\\n').map(l => {
+                                            if (l.startsWith('+')) return '<div class="diff-add">' + l + '</div>';
+                                            if (l.startsWith('-')) return '<div class="diff-remove">' + l + '</div>';
+                                            return '<div>' + l + '</div>';
                                         }).join('');
                                     }
                                     break;
@@ -1489,6 +1517,7 @@ Please automatically try to fix this issue by generating a new JSON Execution Pl
                         });
 
                         vscode.postMessage({ type: 'webviewLoaded' });
+                        diag('Webview initialized and ready.');
                     })();
                 </script>
             </body>
